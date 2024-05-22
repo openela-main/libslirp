@@ -1,6 +1,6 @@
 Name:           libslirp
 Version:        4.4.0
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        A general purpose TCP-IP emulator
 
 # check the SPDX tags in source files for details
@@ -61,6 +61,10 @@ developing applications that use %{name}.
 
 
 %changelog
+* Fri Apr 12 2024 Lokesh Mandvekar <lsm5@redhat.com> - 4.4.0-2
+- rebuild to preserve upgrade path 8.9 -> 8.10
+- Related: RHEL-32671
+
 * Mon Jun 28 2021 Jindrich Novy <jnovy@redhat.com> - 4.4.0-1
 - Fix CVE-2021-3592 CVE-2021-3593 CVE-2021-3594 CVE-2021-3595 out-of-bounds access
 - Related: #1934415
