@@ -1,6 +1,6 @@
 Name:           libslirp
 Version:        4.4.0
-Release:        7%{?dist}
+Release:        8%{?dist}
 Summary:        A general purpose TCP-IP emulator
 
 # check the SPDX tags in source files for details
@@ -16,7 +16,8 @@ Patch0006: 0006-tftp-introduce-a-header-structure.patch
 Patch0007: 0007-udp-check-upd_input-buffer-size.patch
 Patch0008: 0001-Fix-DHCP-broken-in-libslirp-v4.6.0.patch
 Patch0009: 0001-New-utility-slirp_ether_ntoa.patch
-Patch00010: 0002-Replace-inet_ntoa-with-safer-inet_ntop.patch
+Patch0010: 0002-Replace-inet_ntoa-with-safer-inet_ntop.patch
+Patch0011: 0001-ip-Enforce-strict-aliasing.patch
 
 
 BuildRequires:  git-core
@@ -63,6 +64,10 @@ developing applications that use %{name}.
 
 
 %changelog
+* Mon Jun 03 2024 Marc-André Lureau <marcandre.lureau@redhat.com> - 4.4.0-8
+- Backport upstream commit b09dbd9557 ("ip: Enforce strict aliasing")
+  Fixes JIRA RHEL-27868
+
 * Fri Feb 11 2022 Jindrich Novy <jnovy@redhat.com> - 4.4.0-7
 - fix also socket.c, thanks to Marc-André Lureau
 - Related: #2000051
