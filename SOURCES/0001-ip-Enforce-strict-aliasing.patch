@@ -1,0 +1,405 @@
+From 26be815b86e8d49add8c9a8b320239b9594ff03d Mon Sep 17 00:00:00 2001
+From: Akihiko Odaki <akihiko.odaki@daynix.com>
+Date: Mon, 30 Jan 2023 14:56:02 +0900
+Subject: [PATCH] ip: Enforce strict aliasing
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Sometimes ipq were casted to ipasfrag, and the original and casted
+pointer were used simultaneously in ip_reass(). GCC 12.1.0 assumes
+these pointers are not aliases, and therefore incorrectly the pointed
+data will not be modified when it is actually modified with another
+pointer.
+
+To fix this problem, introduce a new type "ipas", which is a universal
+type denoting an entry in the assembly queue and contains union for
+specialization as queue head (frequently referred as "q" or "ipq" in
+the source code) or IP fragment ("f" or "ipf").
+
+This bug was found by Alexander Bulekov when fuzzing QEMU:
+https://patchew.org/QEMU/20230129053316.1071513-1-alxndr@bu.edu/
+
+The fixed test case is:
+fuzz/crash_449dd4ad72212627fe3245c875f79a7033cc5382
+
+Signed-off-by: Akihiko Odaki <akihiko.odaki@daynix.com>
+Reviewed-by: Marc-André Lureau <marcandre.lureau@redhat.com>
+---
+ src/ip.h       |  21 ++----
+ src/ip_input.c | 169 ++++++++++++++++++++++++-------------------------
+ 2 files changed, 90 insertions(+), 100 deletions(-)
+
+diff --git a/src/ip.h b/src/ip.h
+index bfe1d36..f0859f0 100644
+--- a/src/ip.h
++++ b/src/ip.h
+@@ -214,10 +214,8 @@ struct ipovly {
+  * being reassembled is attached to one of these structures.
+  * They are timed out after ipq_ttl drops to 0, and may also
+  * be reclaimed if memory becomes tight.
+- * size 28 bytes
+  */
+ struct ipq {
+-    struct qlink frag_link; /* to ip headers of fragments */
+     struct qlink ip_link; /* to other reass headers */
+     uint8_t ipq_ttl; /* time for reass q to live */
+     uint8_t ipq_p; /* protocol of this fragment */
+@@ -225,23 +223,16 @@ struct ipq {
+     struct in_addr ipq_src, ipq_dst;
+ };
+ 
+-/*
+- * Ip header, when holding a fragment.
+- *
+- * Note: ipf_link must be at same offset as frag_link above
+- */
+-struct ipasfrag {
+-    struct qlink ipf_link;
+-    struct ip ipf_ip;
++struct ipas {
++    struct qlink link;
++    union {
++        struct ipq ipq;
++        struct ip ipf_ip;
++    };
+ };
+ 
+-G_STATIC_ASSERT(offsetof(struct ipq, frag_link) ==
+-                offsetof(struct ipasfrag, ipf_link));
+-
+ #define ipf_off ipf_ip.ip_off
+ #define ipf_tos ipf_ip.ip_tos
+ #define ipf_len ipf_ip.ip_len
+-#define ipf_next ipf_link.next
+-#define ipf_prev ipf_link.prev
+ 
+ #endif
+diff --git a/src/ip_input.c b/src/ip_input.c
+index 4190889..4860e7a 100644
+--- a/src/ip_input.c
++++ b/src/ip_input.c
+@@ -41,8 +41,8 @@
+ 
+ static struct ip *ip_reass(Slirp *slirp, struct ip *ip, struct ipq *fp);
+ static void ip_freef(Slirp *slirp, struct ipq *fp);
+-static void ip_enq(register struct ipasfrag *p, register struct ipasfrag *prev);
+-static void ip_deq(register struct ipasfrag *p);
++static void ip_enq(register struct ipas *p, register struct ipas *prev);
++static void ip_deq(register struct ipas *p);
+ 
+ /*
+  * IP initialization: fill in IP protocol switch table.
+@@ -146,7 +146,7 @@ void ip_input(struct mbuf *m)
+      * XXX This should fail, don't fragment yet
+      */
+     if (ip->ip_off & ~IP_DF) {
+-        register struct ipq *fp;
++        register struct ipq *q;
+         struct qlink *l;
+         /*
+          * Look for queue of fragments
+@@ -154,14 +154,14 @@ void ip_input(struct mbuf *m)
+          */
+         for (l = slirp->ipq.ip_link.next; l != &slirp->ipq.ip_link;
+              l = l->next) {
+-            fp = container_of(l, struct ipq, ip_link);
+-            if (ip->ip_id == fp->ipq_id &&
+-                ip->ip_src.s_addr == fp->ipq_src.s_addr &&
+-                ip->ip_dst.s_addr == fp->ipq_dst.s_addr &&
+-                ip->ip_p == fp->ipq_p)
++            q = container_of(l, struct ipq, ip_link);
++            if (ip->ip_id == q->ipq_id &&
++                ip->ip_src.s_addr == q->ipq_src.s_addr &&
++                ip->ip_dst.s_addr == q->ipq_dst.s_addr &&
++                ip->ip_p == q->ipq_p)
+                 goto found;
+         }
+-        fp = NULL;
++        q = NULL;
+     found:
+ 
+         /*
+@@ -183,12 +183,12 @@ void ip_input(struct mbuf *m)
+          * attempt reassembly; if it succeeds, proceed.
+          */
+         if (ip->ip_tos & 1 || ip->ip_off) {
+-            ip = ip_reass(slirp, ip, fp);
++            ip = ip_reass(slirp, ip, q);
+             if (ip == NULL)
+                 return;
+             m = dtom(slirp, ip);
+-        } else if (fp)
+-            ip_freef(slirp, fp);
++        } else if (q)
++            ip_freef(slirp, q);
+ 
+     } else
+         ip->ip_len -= hlen;
+@@ -214,24 +214,25 @@ bad:
+     m_free(m);
+ }
+ 
+-#define iptofrag(P) ((struct ipasfrag *)(((char *)(P)) - sizeof(struct qlink)))
+-#define fragtoip(P) ((struct ip *)(((char *)(P)) + sizeof(struct qlink)))
++#define iptoas(P) container_of((P), struct ipas, ipf_ip)
++#define astoip(P) (&(P)->ipf_ip)
+ /*
+  * Take incoming datagram fragment and try to
+  * reassemble it into whole datagram.  If a chain for
+  * reassembly of this datagram already exists, then it
+- * is given as fp; otherwise have to make a chain.
++ * is given as q; otherwise have to make a chain.
+  */
+-static struct ip *ip_reass(Slirp *slirp, struct ip *ip, struct ipq *fp)
++static struct ip *ip_reass(Slirp *slirp, struct ip *ip, struct ipq *q)
+ {
+     register struct mbuf *m = dtom(slirp, ip);
+-    register struct ipasfrag *q;
++    struct ipas *first = container_of(q, struct ipas, ipq);
++    register struct ipas *cursor;
+     int hlen = ip->ip_hl << 2;
+     int i, next;
+ 
+     DEBUG_CALL("ip_reass");
+     DEBUG_ARG("ip = %p", ip);
+-    DEBUG_ARG("fp = %p", fp);
++    DEBUG_ARG("q = %p", q);
+     DEBUG_ARG("m = %p", m);
+ 
+     /*
+@@ -245,30 +246,30 @@ static struct ip *ip_reass(Slirp *slirp, struct ip *ip, struct ipq *fp)
+     /*
+      * If first fragment to arrive, create a reassembly queue.
+      */
+-    if (fp == NULL) {
++    if (q == NULL) {
+         struct mbuf *t = m_get(slirp);
+ 
+         if (t == NULL) {
+             goto dropfrag;
+         }
+-        fp = mtod(t, struct ipq *);
+-        slirp_insque(&fp->ip_link, &slirp->ipq.ip_link);
+-        fp->ipq_ttl = IPFRAGTTL;
+-        fp->ipq_p = ip->ip_p;
+-        fp->ipq_id = ip->ip_id;
+-        fp->frag_link.next = fp->frag_link.prev = &fp->frag_link;
+-        fp->ipq_src = ip->ip_src;
+-        fp->ipq_dst = ip->ip_dst;
+-        q = (struct ipasfrag *)fp;
++        first = mtod(t, struct ipas *);
++        q = &first->ipq;
++        slirp_insque(&q->ip_link, &slirp->ipq.ip_link);
++        q->ipq_ttl = IPFRAGTTL;
++        q->ipq_p = ip->ip_p;
++        q->ipq_id = ip->ip_id;
++        first->link.next = first->link.prev = first;
++        q->ipq_src = ip->ip_src;
++        q->ipq_dst = ip->ip_dst;
++        cursor = first;
+         goto insert;
+     }
+ 
+     /*
+      * Find a segment which begins after this one does.
+      */
+-    for (q = fp->frag_link.next; q != (struct ipasfrag *)&fp->frag_link;
+-         q = q->ipf_next)
+-        if (q->ipf_off > ip->ip_off)
++    for (cursor = first->link.next; cursor != first; cursor = cursor->link.next)
++        if (cursor->ipf_off > ip->ip_off)
+             break;
+ 
+     /*
+@@ -276,8 +277,8 @@ static struct ip *ip_reass(Slirp *slirp, struct ip *ip, struct ipq *fp)
+      * our data already.  If so, drop the data from the incoming
+      * segment.  If it provides all of our data, drop us.
+      */
+-    if (q->ipf_prev != &fp->frag_link) {
+-        struct ipasfrag *pq = q->ipf_prev;
++    if (cursor->link.prev != first) {
++        struct ipas *pq = cursor->link.prev;
+         i = pq->ipf_off + pq->ipf_len - ip->ip_off;
+         if (i > 0) {
+             if (i >= ip->ip_len)
+@@ -292,18 +293,17 @@ static struct ip *ip_reass(Slirp *slirp, struct ip *ip, struct ipq *fp)
+      * While we overlap succeeding segments trim them or,
+      * if they are completely covered, dequeue them.
+      */
+-    while (q != (struct ipasfrag *)&fp->frag_link &&
+-           ip->ip_off + ip->ip_len > q->ipf_off) {
+-        struct ipasfrag *prev;
+-        i = (ip->ip_off + ip->ip_len) - q->ipf_off;
+-        if (i < q->ipf_len) {
+-            q->ipf_len -= i;
+-            q->ipf_off += i;
+-            m_adj(dtom(slirp, q), i);
++    while (cursor != first && ip->ip_off + ip->ip_len > cursor->ipf_off) {
++        struct ipas *prev;
++        i = (ip->ip_off + ip->ip_len) - cursor->ipf_off;
++        if (i < cursor->ipf_len) {
++            cursor->ipf_len -= i;
++            cursor->ipf_off += i;
++            m_adj(dtom(slirp, cursor), i);
+             break;
+         }
+-        prev = q;
+-        q = q->ipf_next;
++        prev = cursor;
++        cursor = cursor->link.next;
+         ip_deq(prev);
+         m_free(dtom(slirp, prev));
+     }
+@@ -313,28 +313,27 @@ insert:
+      * Stick new segment in its place;
+      * check for complete reassembly.
+      */
+-    ip_enq(iptofrag(ip), q->ipf_prev);
++    ip_enq(iptoas(ip), cursor->link.prev);
+     next = 0;
+-    for (q = fp->frag_link.next; q != (struct ipasfrag *)&fp->frag_link;
+-         q = q->ipf_next) {
+-        if (q->ipf_off != next)
++    for (cursor = first->link.next; cursor != first; cursor = cursor->link.next) {
++        if (cursor->ipf_off != next)
+             return NULL;
+-        next += q->ipf_len;
++        next += cursor->ipf_len;
+     }
+-    if (((struct ipasfrag *)(q->ipf_prev))->ipf_tos & 1)
++    if (((struct ipas *)(cursor->link.prev))->ipf_tos & 1)
+         return NULL;
+ 
+     /*
+      * Reassembly is complete; concatenate fragments.
+      */
+-    q = fp->frag_link.next;
+-    m = dtom(slirp, q);
+-    int delta = (char *)q - (m->m_flags & M_EXT ? m->m_ext : m->m_dat);
+-
+-    q = (struct ipasfrag *)q->ipf_next;
+-    while (q != (struct ipasfrag *)&fp->frag_link) {
+-        struct mbuf *t = dtom(slirp, q);
+-        q = (struct ipasfrag *)q->ipf_next;
++    cursor = first->link.next;
++    m = dtom(slirp, cursor);
++    int delta = (char *)cursor - (m->m_flags & M_EXT ? m->m_ext : m->m_dat);
++
++    cursor = cursor->link.next;
++    while (cursor != first) {
++        struct mbuf *t = dtom(slirp, cursor);
++        cursor = cursor->link.next;
+         m_cat(m, t);
+     }
+ 
+@@ -344,25 +343,25 @@ insert:
+      * dequeue and discard fragment reassembly header.
+      * Make header visible.
+      */
+-    q = fp->frag_link.next;
++    cursor = first->link.next;
+ 
+     /*
+      * If the fragments concatenated to an mbuf that's bigger than the total
+      * size of the fragment and the mbuf was not already using an m_ext buffer,
+-     * then an m_ext buffer was allocated. But fp->ipq_next points to the old
++     * then an m_ext buffer was allocated. But q->ipq_next points to the old
+      * buffer (in the mbuf), so we must point ip into the new buffer.
+      */
+     if (m->m_flags & M_EXT) {
+-        q = (struct ipasfrag *)(m->m_ext + delta);
++        cursor = (struct ipas *)(m->m_ext + delta);
+     }
+ 
+-    ip = fragtoip(q);
++    ip = astoip(cursor);
+     ip->ip_len = next;
+     ip->ip_tos &= ~1;
+-    ip->ip_src = fp->ipq_src;
+-    ip->ip_dst = fp->ipq_dst;
+-    slirp_remque(&fp->ip_link);
+-    m_free(dtom(slirp, fp));
++    ip->ip_src = q->ipq_src;
++    ip->ip_dst = q->ipq_dst;
++    slirp_remque(&q->ip_link);
++    m_free(dtom(slirp, q));
+     m->m_len += (ip->ip_hl << 2);
+     m->m_data -= (ip->ip_hl << 2);
+ 
+@@ -377,41 +376,41 @@ dropfrag:
+  * Free a fragment reassembly header and all
+  * associated datagrams.
+  */
+-static void ip_freef(Slirp *slirp, struct ipq *fp)
++static void ip_freef(Slirp *slirp, struct ipq *q)
+ {
+-    register struct ipasfrag *q, *p;
++    struct ipas *first = container_of(q, struct ipas, ipq);
++    register struct ipas *cursor, *next;
+ 
+-    for (q = fp->frag_link.next; q != (struct ipasfrag *)&fp->frag_link;
+-         q = p) {
+-        p = q->ipf_next;
+-        ip_deq(q);
+-        m_free(dtom(slirp, q));
++    for (cursor = first->link.next; cursor != first; cursor = next) {
++        next = cursor->link.next;
++        ip_deq(cursor);
++        m_free(dtom(slirp, cursor));
+     }
+-    slirp_remque(&fp->ip_link);
+-    m_free(dtom(slirp, fp));
++    slirp_remque(&q->ip_link);
++    m_free(dtom(slirp, q));
+ }
+ 
+ /*
+  * Put an ip fragment on a reassembly chain.
+  * Like slirp_insque, but pointers in middle of structure.
+  */
+-static void ip_enq(register struct ipasfrag *p, register struct ipasfrag *prev)
++static void ip_enq(register struct ipas *p, register struct ipas *prev)
+ {
+     DEBUG_CALL("ip_enq");
+     DEBUG_ARG("prev = %p", prev);
+-    p->ipf_prev = prev;
+-    p->ipf_next = prev->ipf_next;
+-    ((struct ipasfrag *)(prev->ipf_next))->ipf_prev = p;
+-    prev->ipf_next = p;
++    p->link.prev = prev;
++    p->link.next = prev->link.next;
++    ((struct ipas *)(prev->link.next))->link.prev = p;
++    prev->link.next = p;
+ }
+ 
+ /*
+  * To ip_enq as slirp_remque is to slirp_insque.
+  */
+-static void ip_deq(register struct ipasfrag *p)
++static void ip_deq(register struct ipas *p)
+ {
+-    ((struct ipasfrag *)(p->ipf_prev))->ipf_next = p->ipf_next;
+-    ((struct ipasfrag *)(p->ipf_next))->ipf_prev = p->ipf_prev;
++    ((struct ipas *)(p->link.prev))->link.next = p->link.next;
++    ((struct ipas *)(p->link.next))->link.prev = p->link.prev;
+ }
+ 
+ /*
+@@ -431,10 +430,10 @@ void ip_slowtimo(Slirp *slirp)
+         return;
+ 
+     while (l != &slirp->ipq.ip_link) {
+-        struct ipq *fp = container_of(l, struct ipq, ip_link);
++        struct ipq *q = container_of(l, struct ipq, ip_link);
+         l = l->next;
+-        if (--fp->ipq_ttl == 0) {
+-            ip_freef(slirp, fp);
++        if (--q->ipq_ttl == 0) {
++            ip_freef(slirp, q);
+         }
+     }
+ }
+-- 
+2.41.0.28.gd7d8841f67
+
